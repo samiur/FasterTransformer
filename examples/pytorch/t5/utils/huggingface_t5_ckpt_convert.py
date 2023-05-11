@@ -44,7 +44,9 @@ def get_weight_data_type(data_type):
         return np.float16
     else:
         assert False, f"Invalid weight data type {data_type}"
-
+        
+def convert_tensor(t, data_type):
+    return t.detach().cpu().type(data_type).numpy()
 
 def fuse_decoder_qkv(model, factor, saved_dir, np_weight_data_type):
     model_dict = {}
@@ -59,7 +61,7 @@ def fuse_decoder_qkv(model, factor, saved_dir, np_weight_data_type):
                          model_dict[f"decoder.block.{i}.layer.0.SelfAttention.v.weight"].T], dim=-1)
 
         qkv = qkv.reshape([shape[0], 3, shape[1]])
-        qkv = qkv.cpu().detach().numpy().astype(np_weight_data_type)
+        qkv = convert_tensor(qkv, np_weight_data_type)
 
         split_vals = np.split(qkv, factor, axis=-1)
         for j in range(factor):
@@ -67,7 +69,9 @@ def fuse_decoder_qkv(model, factor, saved_dir, np_weight_data_type):
             split_vals[j].tofile(saved_path.as_posix())
 
 
-def split_and_convert_process(key, val, factor, saved_dir):
+def split_and_convert_process(key, val, factor, saved_dir, np_weight_data_type):
+    val = convert_tensor(val, np_weight_data_type)
+                         
     if val.ndim == 2:
         val = val.transpose(1, 0)
     saved_key = key
@@ -189,13 +193,17 @@ def convert_checkpoint(args):
 
     i_gpu_num = args.inference_tensor_para_size
 
-    pool = multiprocessing.Pool(args.processes)
-    pool.starmap_async(split_and_convert_process,
-                       [(name, param.cpu().detach().numpy().astype(np_weight_data_type), i_gpu_num, saved_dir)
+    if args.processes > 1:
+        pool = torch.multiprocessing.Pool(args.processes)
+        pool.starmap_async(split_and_convert_process,
+                       [(name, param, i_gpu_num, saved_dir, np_weight_data_type)
                         for name, param in t5_model.state_dict().items()])
 
-    pool.close()
-    pool.join()
+        pool.close()
+        pool.join()
+    else:
+        for name, param in t5_model.state_dict().items():
+            split_and_convert_process(name, param, i_gpu_num, saved_dir, np_weight_data_type)
 
     if not args.encoder_only:
         fuse_decoder_qkv(t5_model, i_gpu_num, saved_dir, np_weight_data_type)
